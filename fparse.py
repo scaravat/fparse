@@ -6,6 +6,7 @@ import sys
 import re
 from os import path
 from pprint import pprint
+from itertools import chain
 
 #===============================================================================
 def main():
@@ -157,10 +158,12 @@ def parse_interface(stream):
 
 #===============================================================================
 def parse_type(stream):
+    doxygen = parse_doxygen(stream)
+
     line = stream.next_fortran_line()
     assert(line.startswith("TYPE"))
     attrlist, sep, name = re.match("TYPE(,BIND\(.*\))?( |::)(.+)", line).groups()
-    ast = {'tag':'type', 'name':name, 'variables':[]}
+    ast = {'tag':'type', 'name':name, 'descr':doxygen['brief'], 'variables':[]}
 
     if attrlist:
         assert(sep=='::')
@@ -181,6 +184,7 @@ def parse_type(stream):
             raise ParserException(line, stream.locus())
 
     set_visibility(ast['variables'], [], private)
+    commit_type_members_descr(ast, doxygen)
 
     return(ast)
 
@@ -536,7 +540,7 @@ def parse_routine(stream):
      'name':name,
      'descr':doxygen['brief'],
      'args':[], 'attrs':[], 'uses':[], 'types':[],
-     'retval':{'tag':'return_value', 'name':name} if whatis=='FUNCTION' else None
+     'retval':{'tag':'return_value', 'name':name, 'descr':None} if whatis=='FUNCTION' else None
     }
 
     # update the ast according to info found in args, prefix and postfix
@@ -636,7 +640,7 @@ def parse_routine(stream):
 def decode_args(ast, args):
     if(args):
         for a in args.split(","):
-            ast['args'].append({'tag':'argument', 'name':a})
+            ast['args'].append({'tag':'argument', 'name':a, 'descr':None})
 
 #===============================================================================
 def decode_prefix(ast, prefix):
@@ -699,23 +703,47 @@ def commit_retval_type(ast, var_decl_list, dimensions):
 
 #===============================================================================
 def commit_args_descr(ast, doxygen):
-    for arg in ast['args']:
-        a = arg['name']
-        arg['descr'] = doxygen['param'][a] if(doxygen['param'].has_key(a)) else ""
-    if(ast['retval']):
-        a = ast['retval']['name']
-        descr = doxygen['retval'][a] if(doxygen['retval'].has_key(a)) else ""
-        if(not descr):
-            # try with plain function name
-            a = ast['name']
-            descr = doxygen['retval'][a] if(doxygen['retval'].has_key(a)) else ""
-        ast['retval']['descr'] = descr
 
+    assert(not doxygen['var'])
+
+    anames = [arg['name'] for arg in ast['args']]
+    for var, descr in doxygen['param'].iteritems():
+        if(isinstance(var, basestring) and var in anames):
+            ast['args'][anames.index(var)]['descr'] = descr
+        elif(isinstance(var, tuple) and all(vv in anames for vv in var)):
+            ast.setdefault('__grouped_args_descr__',[]).append( {'grouped_args':var, 'descr':descr} )
+
+    if(ast['retval']):
+        doxytag = doxygen['retval']
+        if doxytag:
+            assert(len(doxytag)==1)
+            doxyretvalname = doxytag.keys()[0]
+            assert(isinstance(doxyretvalname, basestring))
+
+            a = ast['retval']['name']
+            descr = doxytag[a] if(doxyretvalname == a) else ""
+            if(not descr):
+                # try with plain function name
+                a = ast['name']
+                descr = doxytag[a] if(doxyretvalname == a) else ""
+
+            ast['retval']['descr'] = descr
+
+#===============================================================================
+def commit_type_members_descr(ast, doxygen):
+    names = [v['name'] for v in ast['variables']]
+    for var, descr in chain(doxygen['var'].iteritems(), doxygen['param'].iteritems()):
+        if(isinstance(var, basestring) and var in names):
+            ast['variables'][names.index(var)]['descr'] = descr
+        elif(isinstance(var, tuple) and all(vv in names for vv in var)):
+            ast.setdefault('__grouped_vars_descr__',[]).append( {'grouped_args':var, 'descr':descr} )
+    for v in ast['variables']:
+        v.setdefault('descr')
 
 #===============================================================================
 def parse_doxygen(stream):
     # Initialize
-    doxygen = {'author':[], 'brief':[], 'param':{}, 'retval':{}}
+    doxygen = {'author':[], 'brief':[], 'param':{}, 'retval':{}, 'var':{}}
 
     # Save the beginning line of the subroutine/function
     #   If there is no valid doxygen block before the current subroutine or
@@ -723,7 +751,7 @@ def parse_doxygen(stream):
     #   stream till the end! So we save here a checkpoint that we later enforce
     #   not to be crossed.
     checkpoint, line1 = stream.peek_next_fortran_line(give_pos=True)
-    assert("MODULE" in line1 or "SUBROUTINE" in line1 or "FUNCTION" in line1)
+    assert("MODULE" in line1 or "SUBROUTINE" in line1 or "FUNCTION" in line1 or "TYPE" in line1)
     # advance stream position
     stream.next_fortran_line()
 
@@ -758,7 +786,8 @@ def parse_doxygen(stream):
             entries.append(list(m.groups()))
         else:
             assert(not line.startswith("!> \\")) # are we missing some doxygen tag?
-            entries[-1][1] += " " + line.split("!>",1)[1].strip()
+            if(entries): #TODO: see src/qs_kind_types.F the Doxygen comment above types with no tag
+                entries[-1][1] += " " + line.split("!>",1)[1].strip()
         line = stream.next_line() # advance stream
 
     # interpret doxygen tags
@@ -768,20 +797,138 @@ def parse_doxygen(stream):
                 # Doxygen cmd documentation says:
                 #   "If multiple \brief (\author) commands are present they will be joined"
                 doxygen[k].append(v.strip())
-        elif(k == "param" or k == "retval"):
+        elif(k == "param" or k == "retval" or k == "var"):
             # Filter out [in], [out], ... and (optional) that otherwise will hide the argument
             v = re.sub("^\[(int|in|out|in[.,]? ?out)\]", "", v, count=1).strip()
             v = re.sub("^\((optinal|optional)\)", "", v, count=1).strip()
-            if(v and " " in v):
-               #assert(re.match("\w+",v))
-                a, b = v.split(" ", 1)
-                if(b != "..."):
-                    doxygen[k][a.upper()] = b.strip()
+            if(v):
+                try:
+                    doxygen[k].update( parse_doxyvar(v) )
+                except SM_UnknownCharException:
+                    print '*** Error location: Doxygen block above', stream.locus()
         else:
             pass # ignore all other tags
             #raise(Exception("Strange Doxygen tag:"+k))
 
     return(doxygen)
+
+#===============================================================================
+def parse_doxyvar(tag_content):
+    varlist = []
+    n_opened, n_square = 0, 0
+    state = "start"
+    for i, c in enumerate(tag_content):
+        my_string = tag_content[:i] + "{" + tag_content[i] + "}" + tag_content[i+1:]
+
+        if(state=="start"):
+            if(re.match("\w", c)):
+                varlist.append(c)
+                state = "ini_varname"
+            elif(c=='.'):
+                assert(tag_content=='...')
+                return(dict())
+            else:
+                raise SM_UnknownCharException(c,state,my_string)
+
+        elif(state=="ini_varname"):
+            if(re.match("\w", c)):
+                varlist[-1] += c
+            elif(c==' '):
+                state = "waiting_for_nextvar_or_descr"
+            elif(c=='*'): # src/pexsi_types.F "\param csr_mat* ..." TODO
+                state = "waiting_for_nextvar_or_descr"
+            elif(c==','):
+                state = "waiting_for_next_var_name"
+            elif(c==':'):
+                state = "got_varnames"
+            elif(c=='('):
+                assert(n_opened==0)
+                n_opened = 1
+                ppattern = c
+                state = "p_open%" + state
+            else:
+                raise SM_UnknownCharException(c,state,my_string)
+
+        elif(state=="waiting_for_nextvar_or_descr" or state=="got_varnames"):
+            if(c==' '):
+                pass # go on stripping consecutive blanks
+            elif(c==','):
+                state = "waiting_for_next_var_name"
+            elif(c==':'):
+                state = "got_varnames"
+            elif(c=='='):
+                descr = tag_content
+                state = "got_descr"
+                break
+            elif(re.match("\w", c) or c in ("'", "|", ".", "\\", "-", "*", "?", '"')): #TODO
+                if(tag_content[i:]=='...'):
+                    return(dict())
+                descr = tag_content[i:]
+                state = "got_descr"
+                break
+            elif(c=='('):
+                assert(n_opened==0)
+                n_opened = 1
+                ppattern = c
+                state = "p_open%" + state
+            elif(c=='['):
+                assert(n_square==0)
+                n_square = 1
+                sqpattern = c
+                state = "sq_open%" + state
+            else:
+                raise SM_UnknownCharException(c,state,my_string)
+
+        elif(state=="waiting_for_next_var_name"):
+            if(c==' '):
+                pass
+            elif(re.match("\w", c)):
+                varlist.append(c)
+                state = "ini_varname"
+            else:
+                raise SM_UnknownCharException(c,state,my_string)
+
+        elif(state.startswith("p_open%")):
+            ppattern += c
+            if(c == "("):
+                n_opened += 1
+            elif(c == ")"):
+                n_opened -= 1
+                if(n_opened==0):
+                    prev_state = state.split("%",1)[1]
+                    if(not prev_state in ("ini_varname", "waiting_for_nextvar_or_descr")):
+                        raise Exception('unknown previous state: "%s"'%prev_state)
+                    state = prev_state
+
+        elif(state.startswith("sq_open%")):
+            sqpattern += c
+            if(c == "["):
+                n_square += 1
+            elif(c == "]"):
+                n_square -= 1
+                if(n_square==0):
+                    prev_state = state.split("%",1)[1]
+                    if(not prev_state in ("waiting_for_nextvar_or_descr", "got_varnames")):
+                        raise Exception('unknown previous state: "%s" [%s]'%(prev_state, tag_content))
+                    state = prev_state
+
+        else:
+            assert(False) # Unknown state
+
+    # check final state
+    if(state=="got_descr"):
+        # allowed final state
+        pass
+    elif(state=="ini_varname" or state=="waiting_for_nextvar_or_descr" or state=="got_varnames"):
+        # no description
+        return(dict())
+    else:
+        raise Exception('unknown final state: "%s" [%s]'%(state, tag_content))
+
+    if len(varlist)==1:
+        return {varlist.pop().upper():descr}
+    else:
+        return {tuple(v.upper() for v in varlist):descr}
 
 #===============================================================================
 def parse_use_statement(stream):
@@ -809,7 +956,7 @@ class BackwardEndOfFileException(Exception):
 #===============================================================================
 class SM_UnknownCharException(Exception):
     def __init__(self, c, state, string):
-        print 'char "%c" unknown for state "%s" [%s]' % (c, state, string)
+        print 'SM_Error: char "%c" unknown for state "%s" [%s]' % (c, state, string)
 
 #===============================================================================
 class ParserException(Exception):
