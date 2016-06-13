@@ -784,6 +784,11 @@ def parse_doxygen(stream):
         m = re.search(r"\\([a-z]+)(.*)", line, re.I) # the 2nd group could be an empty string (cf. \note)
         if(m):
             entries.append(list(m.groups()))
+        elif line == "!>":
+            # Doxygen cmd documentation says:
+            #   "A brief description ends when a blank line or another sectioning command is encountered."
+            # so let's start a new fake entry
+            entries.append([None, ''])
         else:
             assert(not line.startswith("!> \\")) # are we missing some doxygen tag?
             if(entries): #TODO: see src/qs_kind_types.F the Doxygen comment above types with no tag
