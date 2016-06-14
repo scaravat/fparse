@@ -147,8 +147,7 @@ def parse_interface(stream):
                 ast['task'] = 'explicit_interface'
             f = parse_routine(stream)
             assert(f['tag'] in ("subroutine", "function"))
-            # only the name and tag of the subroutine/function is retained here
-            ast['procedures'].append({'name':f['name'], 'tag':f['tag']})
+            ast['procedures'].append(f)
     # abstract interfaces
     if prefix:
         assert(prefix.strip() == 'ABSTRACT' and len(ast['procedures']) == 1)
