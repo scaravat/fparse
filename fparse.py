@@ -151,6 +151,7 @@ def parse_interface(stream):
     # abstract interfaces
     if prefix:
         assert(prefix.strip() == 'ABSTRACT' and len(ast['procedures']) == 1)
+        assert(not name)
         name = ast['procedures'][0]['name']
         ast.update( {'name':name, 'task':'abstract_interface'} )
     return(ast)
